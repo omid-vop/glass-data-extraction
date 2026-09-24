@@ -1,151 +1,158 @@
 import os
 import shutil
-import base64
-import time
-import pandas as pd
+import platform
 import streamlit as st
+import pandas as pd
 from dotenv import load_dotenv
 from google import genai
 from src.modules.extractor import extract_pdf_multimodal
 
-# --- Configuration ---
-st.set_page_config(page_title="Glass Data Extractor", layout="wide", initial_sidebar_state="expanded")
 load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY")
+api_key = os.getenv("GEMINI_API_KEY")
 
-# Directory Setup
-PAPERS_DIR = r"data\01_raw_papers"
-PROCESSED_DIR = r"data\03_processed_docs"
-STAGING_CSV = r"data\04_output_staging\staging_dataset.csv"
+st.set_page_config(
+    page_title="Glass Data Extraction Pipeline",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# Ensure directories exist
-os.makedirs(PROCESSED_DIR, exist_ok=True)
-os.makedirs(os.path.dirname(STAGING_CSV), exist_ok=True)
+st.title("🔬 Glass Science Literature Extraction Pipeline")
+st.markdown("Extract standardized glass compositions, kinetics, and stress profile data into your master dataset.")
 
-# --- Initialization ---
-if "client" not in st.session_state:
-    st.session_state.client = genai.Client(api_key=API_KEY) if API_KEY else None
-
-if "extracted_df" not in st.session_state:
-    st.session_state.extracted_df = pd.DataFrame()
-
-
-def display_pdf(file_path):
-    """Embeds the PDF in the Streamlit app."""
-    with open(file_path, "rb") as f:
-        base64_pdf = base64.b64encode(f.read()).decode('utf-8')
-    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}#toolbar=0&navpanes=0" width="100%" height="750" type="application/pdf"></iframe>'
-    st.markdown(pdf_display, unsafe_allow_html=True)
-
-
-# --- Column Categorization ---
-COMP_COLS = ["SiO2", "Al2O3", "Na2O", "K2O", "MgO", "CaO", "B2O3", "P2O5", "BaO", "ZnO", "SnO2", "PbO", "ZrO2", "Li2O",
-             "TiO2", "trace", "trace_notes", "GS_wt_percent", "reported_unit"]
-PROC_COLS = ["exchanging_ion", "exchange_side", "E_field", "Tg", "ion_exchange_time_min", "ion_exchange_temperature_c",
-             "E_field_strength_v_cm", "is_standard_process", "reference_DOI"]
-RES_COLS = ["concentration_profile", "DOL_um", "CS_Mpa"]
-
-# --- UI Layout ---
-st.title("🔬 Glass Science Data Extraction Pipeline")
-
-if not st.session_state.client:
-    st.error("API Key missing. Please check your .env file.")
+# Initialize Gemini Client safely
+if not api_key:
+    st.error("❌ GEMINI_API_KEY not found in environment variables. Check your .env file.")
     st.stop()
 
-# Sidebar: File Selection (Only shows unprocessed files)
-available_pdfs = [f for f in os.listdir(PAPERS_DIR) if f.lower().endswith('.pdf')]
+client = genai.Client(api_key=api_key)
+
+# Sidebar Configuration for Directory Scanning & Page Slicing
+st.sidebar.header("⚙️ Extraction Settings")
+
+# Toggle between Papers and Patents
+doc_source = st.sidebar.radio("Select Document Type:", ["Literature Papers", "Patents"])
+
+if doc_source == "Literature Papers":
+    raw_dir = "data/01_raw_papers"
+    processed_dir = "data/02_processed_papers"
+else:
+    raw_dir = "data/02_raw_patents"
+    processed_dir = "data/03_processed_patents"
+
+# Ensure directories exist
+os.makedirs(raw_dir, exist_ok=True)
+os.makedirs(processed_dir, exist_ok=True)
+
+# Automatically scan the selected directory for PDF files
+available_pdfs = [f for f in os.listdir(raw_dir) if f.lower().endswith(".pdf")]
 
 if not available_pdfs:
-    st.sidebar.success("🎉 All caught up! No new papers in the raw folder.")
+    st.sidebar.warning(f"⚠️ No PDF files found in `{raw_dir}`. Please place your PDFs there.")
+    selected_pdf_name = None
 else:
-    selected_pdf = st.sidebar.selectbox("Select PDF to Process:", available_pdfs)
-    pdf_path = os.path.join(PAPERS_DIR, selected_pdf)
+    selected_pdf_name = st.sidebar.selectbox("Select File from Local Directory", available_pdfs)
 
-    # --- Action: Extract Data ---
-    if st.sidebar.button("1. Extract Data from PDF", type="primary", use_container_width=True):
-        st.session_state.extracted_df = pd.DataFrame()  # Clear previous
+start_page = st.sidebar.number_input("Start Page (Token Saver)", min_value=1, value=1)
+end_page = st.sidebar.number_input("End Page (Token Saver)", min_value=1, value=20)
 
-        with st.spinner(f"Analyzing {selected_pdf} (Text + Vision)..."):
-            data, error = extract_pdf_multimodal(st.session_state.client, pdf_path)
+if selected_pdf_name:
+    local_pdf_path = os.path.join(raw_dir, selected_pdf_name)
 
-            if error:
-                st.error(error)
-            elif not data:
-                st.warning("No experimental data found in this document.")
-            else:
-                df = pd.DataFrame(data)
-                # Ensure all columns exist even if LLM missed some
-                for col in COMP_COLS + PROC_COLS + RES_COLS:
-                    if col not in df.columns:
-                        df[col] = None
+    st.sidebar.success(f"📄 Target File:\n`{local_pdf_path}`")
 
-                st.session_state.extracted_df = df
-                st.toast("Extraction Complete!", icon="✅")
+    # Button to open the local PDF automatically on the host machine
+    if st.sidebar.button("📂 Open PDF in Desktop Viewer"):
+        try:
+            if platform.system() == "Windows":
+                os.startfile(local_pdf_path)
+            elif platform.system() == "Darwin":  # macOS
+                os.system(f"open '{local_pdf_path}'")
+            else:  # Linux
+                os.system(f"xdg-open '{local_pdf_path}'")
+            st.sidebar.success("✅ Launched local PDF viewer!")
+        except Exception as e:
+            st.sidebar.error(f"Could not open file automatically: {e}")
 
-# --- Main Workspace: Split Screen ---
-if not st.session_state.extracted_df.empty:
-    st.markdown("---")
-    col1, col2 = st.columns([1, 1.2], gap="large")
+    if st.sidebar.button("🚀 Extract Data from PDF", type="primary"):
+        with st.spinner("Analyzing document via multimodal vision and slicing token payload..."):
+            extracted_data, error_msg = extract_pdf_multimodal(
+                client=client,
+                pdf_path=local_pdf_path,
+                start_page=start_page,
+                end_page=end_page
+            )
+
+        if error_msg:
+            st.error(error_msg)
+        elif not extracted_data:
+            st.warning("⚠️ No structured experiment records were returned by the model.")
+        else:
+            st.success(f"✨ Successfully extracted {len(extracted_data)} experimental records!")
+
+            df_temp = pd.DataFrame(extracted_data)
+            # Convert boolean columns to integer type to prevent NaN dtype conflicts during editing/row deletion
+            for col in df_temp.select_dtypes(include=['bool']).columns:
+                df_temp[col] = df_temp[col].astype(int)
+
+            # Store in session state
+            st.session_state['extracted_df'] = df_temp
+            st.session_state['current_pdf'] = selected_pdf_name
+            st.session_state['current_pdf_path'] = local_pdf_path
+
+# Main Panel Display & Editable Approval Workflow
+if 'extracted_df' in st.session_state and st.session_state['extracted_df'] is not None:
+    st.subheader(f"📊 Editable Verification Panel for: `{st.session_state['current_pdf']}`")
+    st.info(
+        "💡 **Note:** You can click directly into any cell, add rows, or delete/cut rows using the data editor below before approving.")
+
+    # st.data_editor makes the dataframe interactive and returns the modified DataFrame back to us
+    edited_df = st.data_editor(
+        st.session_state['extracted_df'],
+        use_container_width=True,
+        num_rows="dynamic",
+        key="glass_data_editor"
+    )
+
+    col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("📄 Ground Truth Document")
-        display_pdf(pdf_path)
+        if st.button("💾 Approve & Append to Master Dataset", type="primary"):
+            master_path = r"D:\post doc\dataset\Dataset_V8.xlsx"
+            try:
+                # Use the edited_df so all user modifications are preserved
+                if os.path.exists(master_path):
+                    df_master = pd.read_excel(master_path)
+                    df_updated = pd.concat([df_master, edited_df], ignore_index=True)
+                else:
+                    df_updated = edited_df
+
+                os.makedirs(os.path.dirname(master_path), exist_ok=True)
+                df_updated.to_excel(master_path, index=False)
+
+                # Automatically move PDF from raw to processed folder
+                dest_path = os.path.join(processed_dir, st.session_state['current_pdf'])
+                if os.path.exists(st.session_state['current_pdf_path']):
+                    shutil.move(st.session_state['current_pdf_path'], dest_path)
+
+                st.success(
+                    f"✅ Approved! Appended modified records to master dataset and moved file to `{processed_dir}`.")
+
+                # Clear session state so UI resets for the next paper
+                del st.session_state['extracted_df']
+                del st.session_state['current_pdf']
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Failed during approval workflow: {e}")
 
     with col2:
-        st.subheader("⚙️ Verify and Edit Data")
-
-        # Categorized tabs
-        tab1, tab2, tab3 = st.tabs(["🧪 Composition", "🌡️ Process Params", "📊 Results (Penetration / DOL / CS)"])
-
-        with tab1:
-            st.caption("Verify Oxide mass/mole fractions and trace elements.")
-            edited_comp = st.data_editor(st.session_state.extracted_df[COMP_COLS], num_rows="dynamic",
-                                         use_container_width=True, key="comp")
-
-        with tab2:
-            st.caption("Verify temperatures, times, and boundary conditions.")
-            edited_proc = st.data_editor(st.session_state.extracted_df[PROC_COLS], num_rows="dynamic",
-                                         use_container_width=True, key="proc")
-
-        with tab3:
-            st.caption("Cross-reference C(x,t) profile arrays, DOL, and CS with paper figures.")
-            edited_res = st.data_editor(st.session_state.extracted_df[RES_COLS], num_rows="dynamic",
-                                        use_container_width=True, key="res")
-
-        st.markdown("---")
-
-        # --- Action: Save & Archive ---
-        if st.button("2. Approve Data & Archive PDF", type="primary", use_container_width=True):
-            # Recombine the edited tabs
-            final_df = pd.concat([edited_comp, edited_proc, edited_res], axis=1)
-            final_df.insert(0, "Source_File", selected_pdf)
-
-            # Update Dataset Logic
-            if os.path.exists(STAGING_CSV):
-                master_df = pd.read_csv(STAGING_CSV)
-
-                # Check if the PDF has been processed before and remove its old rows
-                if "Source_File" in master_df.columns:
-                    master_df = master_df[master_df["Source_File"] != selected_pdf]
-
-                updated_master = pd.concat([master_df, final_df], ignore_index=True)
-            else:
-                updated_master = final_df
-
-            updated_master.to_csv(STAGING_CSV, index=False)
-
-            # Safely archive PDF
-            processed_path = os.path.join(PROCESSED_DIR, selected_pdf)
-
-            try:
-                shutil.copy2(pdf_path, processed_path)
-                st.session_state.extracted_df = pd.DataFrame()
-                os.remove(pdf_path)
-                st.success(
-                    f"✅ Saved {len(final_df)} rows for {selected_pdf} (overwriting previous entries if any) and archived document!")
-            except PermissionError:
-                st.session_state.extracted_df = pd.DataFrame()
-                st.warning(f"✅ Data saved and PDF copied to processed folder.")
-
-            time.sleep(1.5)
+        if st.button("🗑️ Discard / Re-extract"):
+            if 'extracted_df' in st.session_state:
+                del st.session_state['extracted_df']
             st.rerun()
+
+else:
+    if not available_pdfs:
+        st.info(f"👈 Please add your PDF documents into `{raw_dir}` to begin extraction.")
+    else:
+        st.info("👈 Select a document from the sidebar and click **'Extract Data from PDF'** to begin verification.")
